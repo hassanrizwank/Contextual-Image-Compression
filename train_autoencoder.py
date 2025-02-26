@@ -3,33 +3,40 @@ import glob
 import cv2
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras.layers import Input, Conv2D, MaxPooling2D, UpSampling2D, concatenate
-from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Conv2D, MaxPooling2D, UpSampling2D, concatenate # type: ignore
+from tensorflow.keras.models import Model # type: ignore
 
 def build_autoencoder(input_shape):
     """Builds an autoencoder model for image compression with skip connections."""
     input_img = Input(shape=input_shape)
 
-    # Encoder
+    # **Encoder**
     x1 = Conv2D(32, (3, 3), activation='relu', padding='same')(input_img)
-    x1 = MaxPooling2D((2, 2), padding='same')(x1)  # Downsample 1
-    
-    x2 = Conv2D(64, (3, 3), activation='relu', padding='same')(x1)
-    encoded = MaxPooling2D((2, 2), padding='same')(x2)  # Downsample 2
+    x1_pooled = MaxPooling2D((2, 2), padding='same')(x1)  # (64, 64, 32)
 
-    # Decoder
+    x2 = Conv2D(64, (3, 3), activation='relu', padding='same')(x1_pooled)
+    encoded = MaxPooling2D((2, 2), padding='same')(x2)  # (32, 32, 64)
+
+    # **Decoder**
     x = Conv2D(64, (3, 3), activation='relu', padding='same')(encoded)
-    x = UpSampling2D((2, 2))(x)  # Upsample 1
-    x = concatenate([x, x2])  # Skip connection from encoder layer
+    x = UpSampling2D((2, 2))(x)  # (64, 64, 64)
+
+    # Ensure x2 matches the shape of x before concatenation
+    x2_resized = Conv2D(64, (3, 3), activation='relu', padding='same')(x2)  # (64, 64, 64)
+    x = concatenate([x, x2_resized])  # (64, 64, 128)
 
     x = Conv2D(32, (3, 3), activation='relu', padding='same')(x)
-    x = UpSampling2D((2, 2))(x)  # Upsample 2
-    x = concatenate([x, x1])  # Skip connection from encoder layer
+    x = UpSampling2D((2, 2))(x)  # (128, 128, 32)
 
-    decoded = Conv2D(input_shape[2], (3, 3), activation='sigmoid', padding='same')(x)
+    # Ensure x1 matches the shape of x before concatenation
+    x1_resized = Conv2D(32, (3, 3), activation='relu', padding='same')(x1)  # (128, 128, 32)
+    x = concatenate([x, x1_resized])  # (128, 128, 64)
+
+    decoded = Conv2D(input_shape[2], (3, 3), activation='sigmoid', padding='same')(x)  # (128, 128, 3)
 
     autoencoder = Model(input_img, decoded)
     autoencoder.compile(optimizer='adam', loss='mse')
+
     return autoencoder
 
 def load_images_from_folder(folder, target_size):
