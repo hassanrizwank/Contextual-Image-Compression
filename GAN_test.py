@@ -9,6 +9,7 @@ from tensorflow import keras
 import glob
 import time
 import matplotlib.pyplot as plt
+from scipy.ndimage import gaussian_filter
 from GAN_functions import (
     load_and_preprocess_image, compute_saliency_map, create_saliency_mask,
     compute_metrics, estimate_compression_ratio, visualize_results,
@@ -19,7 +20,9 @@ from GAN_functions import (
 IMG_SIZE = (256, 256)
 IMG_SHAPE = (IMG_SIZE[0], IMG_SIZE[1], 3)
 BASE_LATENT_DIM = 512  # Should match training config
-HQ_LATENT_DIM = BASE_LATENT_DIM * 4
+HQ_LATENT_DIM = BASE_LATENT_DIM * 6
+
+
 
 # Directories
 TEST_DIR = "test_dataset"
@@ -107,42 +110,36 @@ def load_test_images(test_dir):
     
     return test_images, file_names, original_sizes
 
+# In compress_and_reconstruct function
 def compress_and_reconstruct(img, hq_encoder, hq_generator, lq_encoder, lq_generator):
-    """
-    Compress and reconstruct an image using the adaptive compression model.
-    """
     # Generate saliency map
-    saliency_map = compute_saliency_map(img)
+    saliency_map = compute_saliency_map(img, method='combined')
     mask = create_saliency_mask(saliency_map, smooth=True)
     
-    # Create expanded mask for blending
-
-    enhanced_mask = np.power(mask, 0.7)
-    expanded_mask = np.expand_dims(enhanced_mask, axis=-1)
-    expanded_mask = np.expand_dims(expanded_mask, axis=0)  # Add batch dimension
+    # Create smooth transition between regions using Gaussian filter
+    transition_mask = gaussian_filter(mask, sigma=3)
+    expanded_mask = np.expand_dims(np.expand_dims(transition_mask, axis=-1), axis=0)
     
-    # Add batch dimension to image
+    # Use sigmoid to create a smoother transition between HQ and LQ regions
+    blend_factor = 1.0 / (1.0 + np.exp(-10 * (expanded_mask - 0.5)))
+    
+    # Encode and decode
     img_batch = np.expand_dims(img, axis=0)
-    
-    # Encode with both encoders
     hq_latent = hq_encoder.predict(img_batch)
     lq_latent = lq_encoder.predict(img_batch)
-    
-    # Decode with both generators
     hq_output = hq_generator.predict(hq_latent)
     lq_output = lq_generator.predict(lq_latent)
     
-    # Blend outputs based on saliency
-    blended_output = hq_output * expanded_mask + lq_output * (1 - expanded_mask)
+    # Smoother blending
+    blended_output = hq_output * blend_factor + lq_output * (1 - blend_factor)
     
-    # Return all outputs and the saliency map for analysis
     return {
         'saliency_map': mask,
-        'hq_latent': hq_latent[0],  # Remove batch dimension
-        'lq_latent': lq_latent[0],  # Remove batch dimension
-        'hq_output': hq_output[0],  # Remove batch dimension
-        'lq_output': lq_output[0],  # Remove batch dimension
-        'blended_output': blended_output[0],  # Remove batch dimension
+        'hq_latent': hq_latent[0],
+        'lq_latent': lq_latent[0],
+        'hq_output': hq_output[0],
+        'lq_output': lq_output[0],
+        'blended_output': blended_output[0],
     }
 
 def test_compression(test_images, file_names, original_sizes, hq_encoder, hq_generator, lq_encoder, lq_generator):
