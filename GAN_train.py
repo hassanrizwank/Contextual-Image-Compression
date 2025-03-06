@@ -7,6 +7,7 @@ import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras.applications.vgg16 import VGG16 # type: ignore
+from tensorflow.keras.applications import VGG19, VGG16 # type: ignore
 from tensorflow.keras.applications.vgg16 import preprocess_input # type: ignore
 from keras import layers
 import glob
@@ -29,6 +30,8 @@ BASE_LATENT_DIM = 512  # Base dimension for non-salient regions
 BATCH_SIZE = 16
 EPOCHS = 5
 LEARNING_RATE = 1e-4
+
+
 
 # Set memory growth for GPUs
 gpus = tf.config.experimental.list_physical_devices('GPU')
@@ -214,6 +217,17 @@ def build_models():
 
 # Training loop
 def train_gan(dataset, epochs, steps_per_epoch):
+
+# Initialize history dictionary to store losses
+    history = {
+        "d_loss": [],
+        "g_loss": [],
+        "reconstruction_loss": [],
+        "gan_loss": [],
+        "perceptual_loss": [],
+        "l1_loss": []
+    }
+
     # Build models
     # In the train_gan function, make sure both encoder and generator use the same dimensions
     hq_encoder = build_encoder(IMG_SHAPE, BASE_LATENT_DIM * 2, name="hq_encoder")  # 2x instead of 3x
@@ -324,6 +338,88 @@ def train_gan(dataset, epochs, steps_per_epoch):
         
         return d_loss
     
+    def plot_loss_history(history, results_dir):
+        """
+        Plot training loss history.
+        
+        Args:
+            history: Dictionary containing loss values
+            results_dir: Directory to save the plots
+        """
+        plt.figure(figsize=(15, 10))
+        
+        # Plot 1: Main losses
+        plt.subplot(2, 2, 1)
+        plt.plot(history["d_loss"], label="Discriminator Loss", color='r')
+        plt.plot(history["g_loss"], label="Generator Loss", color='b')
+        plt.title("Main Training Losses")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        # Plot 2: Generator loss components
+        plt.subplot(2, 2, 2)
+        plt.plot(history["reconstruction_loss"], label="Reconstruction Loss", color='g')
+        plt.plot(history["gan_loss"], label="GAN Component Loss", color='orange')
+        if "perceptual_loss" in history and history["perceptual_loss"]:
+            plt.plot(history["perceptual_loss"], label="Perceptual Loss", color='purple')
+        if "l1_loss" in history and history["l1_loss"]:
+            plt.plot(history["l1_loss"], label="L1 Loss", color='cyan')
+        plt.title("Generator Loss Components")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        # Plot 3: Loss ratios - reconstruction vs GAN
+        plt.subplot(2, 2, 3)
+        if history["gan_loss"] and history["reconstruction_loss"]:
+            ratio = [r/g if g > 0 else 0 for r, g in zip(history["reconstruction_loss"], history["gan_loss"])]
+            plt.plot(ratio, label="Reconstruction/GAN Ratio", color='m')
+            plt.title("Reconstruction to GAN Loss Ratio")
+            plt.xlabel("Epoch")
+            plt.ylabel("Ratio")
+            plt.yscale('log')  # Log scale makes the ratio easier to visualize
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+        
+        # Plot 4: Learning progress - generator loss zoomed
+        plt.subplot(2, 2, 4)
+        if len(history["g_loss"]) > 5:  # Need enough data for statistics
+            g_losses = np.array(history["g_loss"])
+            # Calculate percentiles to remove outliers for better visualization
+            q1, q3 = np.percentile(g_losses, [25, 75])
+            iqr = q3 - q1
+            upper_bound = q3 + 1.5 * iqr
+            lower_bound = max(0, q1 - 1.5 * iqr)  # Ensure we don't go below 0
+            plt.plot(g_losses, label="Generator Loss", color='b')
+            plt.ylim(lower_bound, upper_bound)
+            plt.title("Generator Loss (Outliers Removed)")
+            plt.xlabel("Epoch")
+            plt.ylabel("Loss")
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        
+        # Save high-resolution plot
+        loss_plot_path = os.path.join(results_dir, "final_loss_history.png")
+        plt.savefig(loss_plot_path, dpi=300, bbox_inches='tight')
+        print(f"Loss plot saved to {loss_plot_path}")
+        
+        # Close the figure to free memory
+        plt.close()
+        
+        # Save the raw loss data as CSV for further analysis
+        try:
+            import pandas as pd
+            loss_data = pd.DataFrame(history)
+            loss_data.to_csv(os.path.join(results_dir, "loss_history.csv"), index_label="epoch")
+            print(f"Loss data saved to {os.path.join(results_dir, 'loss_history.csv')}")
+        except ImportError:
+            print("pandas not available, couldn't save loss data as CSV")
+
     @tf.function
     def train_g_step(images, masks):
         with tf.GradientTape() as g_tape:
@@ -377,22 +473,24 @@ def train_gan(dataset, epochs, steps_per_epoch):
                 perceptual_loss = 0
                 for orig_feat, gen_feat in zip(orig_features, gen_features):
                     # Normalize the feature differences by the feature map size
-                    feature_size = tf.cast(tf.reduce_prod(tf.shape(orig_feat)[1:]), tf.float32)
-                    perceptual_loss += tf.reduce_sum(tf.square(orig_feat - gen_feat)) / feature_size
+                    # feature_size = tf.cast(tf.reduce_prod(tf.shape(orig_feat)[1:]), tf.float32) remove this
+                    perceptual_loss += tf.reduce_mean(tf.square(orig_feat - gen_feat))
                 perceptual_loss /= len(orig_features)
 
-                perceptual_loss *= 0.15  # Increase from 0.0005 to 0.05
+                perceptual_loss *= 0.01  # Increase from 0.0005 to 0.05
                 # Clamp perceptual loss to avoid extreme values
-                perceptual_loss = tf.clip_by_value(perceptual_loss, 0.0, 10.0)
+                perceptual_loss = tf.clip_by_value(perceptual_loss, 0.0, 1.0)
                 l1_loss = tf.reduce_mean(tf.abs(images - gen_imgs))
 
                 # Combine losses with perceptual component
                 g_loss = 0.5 * recon_loss + 0.15 * l1_loss + 0.30 * perceptual_loss + 0.05 * adv_loss
                 # Modified debug print statement that will work with TensorFlow tensors
-                print(f"Recon: {float(recon_loss):.4f}, L1: {float(l1_loss):.4f}, "
-                    f"Perceptual: {float(perceptual_loss):.4f}, Adv: {float(adv_loss):.4f}")
+                tf.print("Recon:", recon_loss, "L1:", l1_loss, "Perceptual:", perceptual_loss, "Adv:", adv_loss)
+
             else:
                 # Combine losses without perceptual component
+                perceptual_loss = tf.constant(0.0)
+                l1_loss = tf.constant(0.0)
                 g_loss = 0.95 * recon_loss + 0.05 * adv_loss
         
         # Get all trainable weights from generator components
@@ -407,7 +505,7 @@ def train_gan(dataset, epochs, steps_per_epoch):
         g_gradients = g_tape.gradient(g_loss, g_trainable_weights)
         g_optimizer.apply_gradients(zip(g_gradients, g_trainable_weights))
         
-        return g_loss, recon_loss, adv_loss
+        return g_loss, recon_loss, adv_loss, perceptual_loss, l1_loss
     
     # Create sample directories
     SAMPLES_DIR = os.path.join(RESULTS_DIR, "training_samples")
@@ -423,7 +521,8 @@ def train_gan(dataset, epochs, steps_per_epoch):
             sample_masks.append(batch_masks[i].numpy())
     
     print(f"Selected {len(sample_images)} sample images for training visualization")
-    history = {"d_loss": [], "g_loss": [], "reconstruction_loss": [], "gan_loss": []}
+    history = {"d_loss": [], "g_loss": [], "reconstruction_loss": [], 
+    "gan_loss": [], "perceptual_loss": [], "l1_loss": []}
     
     # Training loop
     for epoch in range(epochs):
@@ -434,6 +533,8 @@ def train_gan(dataset, epochs, steps_per_epoch):
         g_losses = []
         recon_losses = []
         gan_losses = []
+        perceptual_losses = []
+        l1_losses = []
         
         for step, ((batch_images, batch_masks), _) in enumerate(dataset.take(steps_per_epoch)):
             # Train discriminator only every other batch
@@ -442,10 +543,16 @@ def train_gan(dataset, epochs, steps_per_epoch):
                 d_losses.append(d_loss)
             
             # Train generator
-            g_loss, recon_loss, adv_loss = train_g_step(batch_images, batch_masks)
+            g_loss, recon_loss, adv_loss, perceptual_loss, l1_loss = train_g_step(batch_images, batch_masks)
+
             g_losses.append(g_loss)
             recon_losses.append(recon_loss)
             gan_losses.append(adv_loss)
+
+            if perceptual_loss is not None:
+                perceptual_losses.append(perceptual_loss)
+            if l1_loss is not None:
+                l1_losses.append(l1_loss)
             
             # Print progress
             if (step + 1) % 5 == 0:
@@ -479,12 +586,16 @@ def train_gan(dataset, epochs, steps_per_epoch):
         epoch_g_loss = np.mean([loss.numpy() for loss in g_losses]) if g_losses else float('nan')
         epoch_recon_loss = np.mean([loss.numpy() for loss in recon_losses]) if recon_losses else float('nan')
         epoch_gan_loss = np.mean([loss.numpy() for loss in gan_losses]) if gan_losses else float('nan')
+        epoch_perceptual_loss = np.mean([loss.numpy() for loss in perceptual_losses]) if perceptual_losses else float('nan')
+        epoch_l1_loss = np.mean([loss.numpy() for loss in l1_losses]) if l1_losses else float('nan')
         
         # Update history
         history["d_loss"].append(epoch_d_loss)
         history["g_loss"].append(epoch_g_loss)
         history["reconstruction_loss"].append(epoch_recon_loss)
         history["gan_loss"].append(epoch_gan_loss)
+        history["perceptual_loss"].append(epoch_perceptual_loss if perceptual_losses else float('nan'))
+        history["l1_loss"].append(epoch_l1_loss if l1_losses else float('nan'))
         
         # Print epoch summary
         time_taken = time.time() - start_time
@@ -541,6 +652,8 @@ def train_gan(dataset, epochs, steps_per_epoch):
         print(f"Error saving final models: {e}")
     
     return adaptive_model, discriminator, hq_encoder, hq_generator, lq_encoder, lq_generator
+
+
 
 def main():
     print("Starting training process...")
