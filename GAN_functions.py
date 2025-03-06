@@ -9,6 +9,7 @@ import tensorflow as tf
 from tensorflow import keras
 from keras import layers
 import matplotlib.pyplot as plt
+from skimage.filters import sobel
 from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
 import time
@@ -48,12 +49,18 @@ def save_image(img, path):
     
     cv2.imwrite(path, img)
 
-def compute_saliency_map(image, method='combined'):
+def compute_saliency_map(image, method='spectral_residual'):
     """
-    Compute saliency map using OpenCV's saliency detection with improved combined method.
-    Supported methods: 'spectral_residual', 'fine_grained', 'bing', 'bg_prior', 'combined'
+    Compute saliency map using different methods.
+    
+    Args:
+        image: Input image (normalized to [-1, 1])
+        method: Saliency method to use ('spectral_residual', 'fine_grained', 'combined')
+    
+    Returns:
+        Saliency map with values in range [0, 1]
     """
-    # Convert the normalized image back to [0, 255] range for OpenCV
+    # Convert the normalized image to [0, 255] range for OpenCV
     if image.dtype == np.float32 and np.max(image) <= 1.0:
         image_cv = ((image + 1) * 127.5).astype(np.uint8)
     else:
@@ -64,57 +71,142 @@ def compute_saliency_map(image, method='combined'):
         image_cv = cv2.cvtColor(image_cv, cv2.COLOR_RGB2BGR)
     
     if method == 'combined':
-        # Compute spectral residual saliency
+        # Compute both spectral residual and fine-grained saliency
         spectral_saliency = cv2.saliency.StaticSaliencySpectralResidual_create()
         (success1, spectral_map) = spectral_saliency.computeSaliency(image_cv)
         
-        # Compute fine-grained saliency
         fine_grained_saliency = cv2.saliency.StaticSaliencyFineGrained_create()
         (success2, fine_grained_map) = fine_grained_saliency.computeSaliency(image_cv)
         
-        # Check if either method failed
         if not (success1 and success2):
-            print("Failed to compute one of the saliency methods, falling back to spectral residual")
-            # Try to use whichever one succeeded
+            print(f"Warning: One or more saliency methods failed. Using available method.")
             if success1:
-                saliency_map = spectral_map
+                return spectral_map
             elif success2:
-                saliency_map = fine_grained_map
+                return fine_grained_map
             else:
-                # Return a uniform saliency map as fallback
+                print("All saliency methods failed. Returning uniform saliency.")
                 return np.ones(image_cv.shape[:2], dtype=np.float32)
-        else:
-            # Weight spectral residual higher as it's often more reliable
-            saliency_map = 0.7 * spectral_map + 0.3 * fine_grained_map
+        
+        # Combine the two saliency maps with weighted average
+        # Spectral residual is good at capturing large salient objects
+        # Fine-grained is better at capturing detailed structures
+        combined_map = 0.6 * spectral_map + 0.4 * fine_grained_map
+        
+        # Normalize to [0, 1]
+        if combined_map.max() > 0:
+            combined_map = combined_map / combined_map.max()
+            
+        return combined_map
+    
+    elif method == 'spectral_residual':
+        saliency = cv2.saliency.StaticSaliencySpectralResidual_create()
+    elif method == 'fine_grained':
+        saliency = cv2.saliency.StaticSaliencyFineGrained_create()
     else:
-        # Create saliency object based on method (original implementation)
-        if method == 'spectral_residual':
-            saliency = cv2.saliency.StaticSaliencySpectralResidual_create()
-        elif method == 'fine_grained':
-            saliency = cv2.saliency.StaticSaliencyFineGrained_create()
-        elif method == 'bing':
-            saliency = cv2.saliency.ObjectnessBING_create()
-        elif method == 'bg_prior':
-            saliency = cv2.saliency.MotionSaliencyBinWangApr2014_create()
-        else:
-            raise ValueError(f"Unsupported saliency method: {method}")
-        
-        # Compute saliency
-        (success, saliency_map) = saliency.computeSaliency(image_cv)
-        
-        if not success:
-            print(f"Failed to compute saliency using {method} method.")
-            # Return a uniform saliency map as fallback
-            return np.ones(image_cv.shape[:2], dtype=np.float32)
+        raise ValueError(f"Unsupported saliency method: {method}")
+    
+    # Compute saliency
+    (success, saliency_map) = saliency.computeSaliency(image_cv)
+    
+    if not success:
+        print(f"Failed to compute saliency using {method} method.")
+        # Return a uniform saliency map as fallback
+        return np.ones(image_cv.shape[:2], dtype=np.float32)
     
     # Normalize to [0, 1]
     if saliency_map.max() > 0:
         saliency_map = saliency_map / saliency_map.max()
     
-    # Apply Gaussian blur to smooth the saliency map
-    saliency_map = cv2.GaussianBlur(saliency_map, (5, 5), 0)
-    
     return saliency_map
+
+def enhance_saliency_map(saliency_map):
+    """
+    Enhance saliency map with multi-scale processing for better detail preservation.
+    
+    Args:
+        saliency_map: Original saliency map with values in range [0, 1]
+    
+    Returns:
+        Enhanced saliency map with values in range [0, 1]
+    """
+    # Apply bilateral filter to preserve edges
+    filtered_map = cv2.bilateralFilter(saliency_map.astype(np.float32), 9, 75, 75)
+    
+    # Create multi-scale representation with different Gaussian blurs
+    scales = [3, 9, 15]
+    multi_scale_maps = []
+    
+    for scale in scales:
+        blurred = cv2.GaussianBlur(filtered_map, (scale, scale), 0)
+        multi_scale_maps.append(blurred)
+    
+    # Weight smaller scales (finer details) more heavily
+    weights = [0.5, 0.3, 0.2]  # Weights sum to 1
+    enhanced_map = np.zeros_like(saliency_map)
+    
+    for i, scale_map in enumerate(multi_scale_maps):
+        enhanced_map += weights[i] * scale_map
+    
+    # Apply contrast enhancement
+    enhanced_map = np.power(enhanced_map, 0.8)  # Gamma correction to enhance mid-level saliency
+    
+    # Ensure values are in [0, 1]
+    enhanced_map = np.clip(enhanced_map, 0, 1)
+    
+    return enhanced_map
+
+# Replace the simple create_saliency_mask function around line 70 in paste.txt with:
+def create_saliency_mask(saliency_map, threshold=None, smooth=True):
+    """
+    Create an adaptive saliency mask from the saliency map with improved edge preservation.
+    
+    Args:
+        saliency_map: Saliency map with values in range [0, 1]
+        threshold: Optional threshold value. If None, automatically determined
+        smooth: Whether to apply smoothing to the mask
+        
+    Returns:
+        Binary or smooth mask with values in range [0, 1]
+    """
+    # If threshold is not provided, determine it adaptively
+    if threshold is None:
+        # Use Otsu's method for adaptive thresholding
+        if saliency_map.max() <= 1.0:
+            # Convert to uint8 for Otsu
+            saliency_uint8 = (saliency_map * 255).astype(np.uint8)
+        else:
+            saliency_uint8 = saliency_map.astype(np.uint8)
+        
+        # Get threshold using Otsu's method
+        threshold, _ = cv2.threshold(saliency_uint8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        threshold = threshold / 255.0  # Normalize back to [0, 1]
+        
+        # Adjust threshold based on the distribution of saliency values
+        hist, bins = np.histogram(saliency_map.flatten(), 50, range=(0, 1))
+        cumsum = np.cumsum(hist)
+        cumsum = cumsum / cumsum[-1]  # Normalize to [0, 1]
+        
+        # Find the bin where cumsum exceeds 0.7 (keeping top ~30% as salient)
+        salient_threshold = bins[np.argmax(cumsum > 0.7)]
+        
+        # Take the minimum of Otsu and distribution-based threshold
+        final_threshold = min(threshold, salient_threshold)
+        final_threshold = max(0.05, min(0.5, final_threshold))
+    else:
+        final_threshold = threshold
+    
+    if smooth:
+        # Create continuous mask with edge preservation
+        mask = cv2.bilateralFilter(saliency_map.astype(np.float32), 9, 75, 75)
+        mask = cv2.GaussianBlur(mask, (31, 31), 0)
+        if mask.max() > 0:
+            mask = mask / mask.max()
+    else:
+        # Create binary mask
+        mask = (saliency_map > final_threshold).astype(np.float32)
+    
+    return mask
 
 # In your utils.py or wherever create_saliency_mask is defined
 def create_saliency_mask(saliency_map, threshold=0.1, smooth=True):
